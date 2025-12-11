@@ -1,0 +1,37 @@
+# ==========================================
+# GemKeeper Selectors (Shared Logic)
+# 이 파일은 Git에 포함되어 업데이트됩니다.
+# ==========================================
+
+selectors:
+  user_identifiers:
+    - "user-query-container"
+    - "query-content"
+  
+  model_identifiers:
+    - "response-content"
+    - "model-response-content"
+    
+  stable_id_pattern: "message-content-id-r_"
+  
+  noise_classes:
+    - "model-thoughts"
+    - "thoughts-container"
+    - "input-area"
+    - "speech_to_text_button"
+    - "voice-input-button"
+    - "buttons"
+    - "gap"
+  
+  noise_tags:
+    - "button"
+    - "mat-icon"
+    - "svg"
+    - "mat-tooltip-component"
+    
+  tooltip_pattern: "tooltip"
+
+  # New Selectors (v4.2)
+  header_title: "conversation-actions .conversation-title"
+  message_content_class: "message-content"
+  query_text_class: "query-text"
