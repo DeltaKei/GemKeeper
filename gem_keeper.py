@@ -79,6 +79,32 @@ def ensure_directory(path):
     if not os.path.exists(path):
         os.makedirs(path)
 
+def cleanup_stale_git_locks(repo_path):
+    """
+    Removes stale Git lock files that might prevent operations.
+    Run this at startup to clear locks left by previous crashed runs.
+    """
+    git_dir = os.path.join(repo_path, ".git")
+    if not os.path.isdir(git_dir):
+        return
+
+    lock_files = [
+        "index.lock",
+        "HEAD.lock",
+        "refs/heads/master.lock",
+        "refs/heads/main.lock",
+        "config.lock"
+    ]
+
+    for lock_file in lock_files:
+        lock_path = os.path.join(git_dir, lock_file)
+        if os.path.exists(lock_path):
+            try:
+                os.remove(lock_path)
+                print(f"[Git] Removed stale lock file: {lock_file}")
+            except Exception as e:
+                print(f"[Git] Failed to remove lock file {lock_file}: {e}")
+
 def generate_message_id(role, text_content):
     """
     Generates a deterministic SHA256 hash based on role and text content.
@@ -516,77 +542,176 @@ class GemSessionV4:
             return False
 
     def update_messages(self, scraped_messages):
-        def normalize(text):
-            return ' '.join(text.split())
-
-        changes_made = False
-        new_count = 0
+        """
+        updates self.history to match the order of scraped_messages exactly,
+        while strictly preserving the order appearing in HTML.
         
-        for new_msg in scraped_messages:
-            msg_id = new_msg['id']
+        Logic:
+        1. Identify the 'anchor' point where scraped_messages starts in self.history.
+        2. If found, splice the history: keep everything before the anchor, and append scraped_messages.
+        3. If not found (completely new context or scrolled too far), append or replace based on heuristics.
+        """
+        if not scraped_messages:
+            return
+
+        # 1. Normalize for comparison
+        def get_stable_key(msg):
+            # precise enough to distinguish messages but loose enough to handle minor scrap diffs
+            return f"{msg['role']}:{msg['id']}"
+
+        scraped_keys = [get_stable_key(m) for m in scraped_messages]
+        
+        # 2. Try to find the start of scraped_messages in existing history
+        # We look for the first message of scraped_messages in self.history
+        start_msg_key = scraped_keys[0]
+        match_index = -1
+        
+        # Search backwards to find the most recent occurrence (handling loops/re-generations better)
+        # But logically, we should search from the end? Or just search all.
+        # Let's search all.
+        for i, msg in enumerate(self.history):
+            if get_stable_key(msg) == start_msg_key:
+                match_index = i
+                break # Found the first match point
+        
+        changes_made = False
+        
+        if match_index != -1:
+            # Case A: Overlap Found
+            # We trust the scraper's view as the "current truth" for the tail of the conversation.
+            # However, we must be careful not to delete history just because we scrolled up.
             
-            # Case A: ID Match (Exact same ID found)
-            if msg_id in self.message_map:
-                idx = self.message_map[msg_id]
-                existing_msg = self.history[idx]
-                
-                # Update if new content is longer (Streaming progress)
-                if len(new_msg['text']) > len(existing_msg['text']):
-                    self.history[idx] = new_msg
-                    changes_made = True
+            # Check if scraped_messages significantly deviates from existing history at that point
+            # splice_candidate = self.history[:match_index] + scraped_messages
             
+            # Sub-case: Is scraped_messages just a subset of existing history? (Scrolling up)
+            # Compare scraped_messages with self.history[match_index : match_index + len(scraped)]
+            existing_segment = self.history[match_index : match_index + len(scraped_messages)]
+            
+            is_subset = True
+            if len(existing_segment) != len(scraped_messages):
+                is_subset = False
             else:
-                # Case B: ID Mismatch but Potential Continuation
-                is_merged = False
+                for old, new in zip(existing_segment, scraped_messages):
+                    if get_stable_key(old) != get_stable_key(new):
+                        is_subset = False
+                        break
+            
+            if is_subset:
+                # We are just looking at a past segment. 
+                # Check for content updates (e.g. streaming finished)
+                for i, new_msg in enumerate(scraped_messages):
+                    hist_idx = match_index + i
+                    old_msg = self.history[hist_idx]
+                    if len(new_msg['text']) > len(old_msg['text']) or new_msg['text'] != old_msg['text']:
+                        self.history[hist_idx] = new_msg
+                        changes_made = True
+            else:
+                # Divergence detected! 
+                # The user might have regenerated a response, or edited a prompt in the middle.
+                # In this case, the screen shows the NEW reality.
+                # We splice: Keep history BEFORE the match, and Replace the rest with scraped_messages.
                 
-                if self.history:
-                    last_idx = len(self.history) - 1
-                    last_msg = self.history[last_idx]
-                    
-                    # Condition 1: Same Role
-                    if last_msg['role'] == new_msg['role']:
-                        should_merge = False
-                        
-                        if new_msg['role'] == 'model':
-                            # Aggressive Merge for Model
-                            should_merge = True
-                        else:
-                            # User: Check for text similarity
-                            norm_old = normalize(last_msg['text'])
-                            norm_new = normalize(new_msg['text'])
-                            if norm_new.startswith(norm_old) or norm_old.startswith(norm_new):
-                                should_merge = True
-                                
-                        if should_merge:
-                            # Strategy: Delete Old & Append New
-                            if last_msg['id'] in self.message_map:
-                                del self.message_map[last_msg['id']]
-                            
-                            self.history.pop()
-                            self.history.append(new_msg)
-                            self.message_map[msg_id] = len(self.history) - 1
-                            
-                            changes_made = True
-                            is_merged = True
+                # Wait, if we are scrolling up, we might see messages 5-10, but history has 1-20.
+                # scraped = [5, ... 10]
+                # history = [1, ... 20]
+                # match_index = 4 (0-based)
+                # existing_segment = [5...10]
+                # is_subset = True -> No splicing. just update. 
+                
+                # What if we edited message 10?
+                # scraped = [5, ... 10']
+                # history = [1, ... 10, 11...20]
+                # match_index = 4
+                # existing_segment = [5...10] vs [5...10']
+                # is_subset = False (because 10 != 10' content might differ, ids same?)
+                # If IDs are same, is_subset MIGHT be true depending on get_stable_key.
+                # stable_key uses ID. If ID is hash of content, it changes. 
+                # If ID is DOM ID, it might stay same. 
+                # Gemini DOM IDs usually stable? 
+                
+                # IF ID changes on edit:
+                # scraped = [5, ... 10_new]
+                # match_index of 5 is 4.
+                # Loop checks: 5==5, 6==6, ... 10!=10_new.
+                # is_subset = False.
+                
+                # Splicing Logic:
+                # We trust valid overlap.
+                # If we are strictly following HTML order, we should cut off the old branch.
+                new_history = self.history[:match_index] + scraped_messages
+                
+                # Heuristic: Don't lose future history if we just didn't scrape it all?
+                # If scraped_messages ends at 10_new, but history had 11..20. 
+                # Does the screen show 11..20? The scraper only sees what's visible.
+                # If we cut now, we lose 11..20. 
+                # This is risky. 
+                
+                # Refined Logic:
+                # Only cut if we have strong evidence of divergence (ID mismatch).
+                # If IDs match but text differs, just update text.
+                # If ID mismatch implies new branch.
+                
+                # Let's try to "merge" the tail if possible?
+                # No, user wants "HTML Text Order". HTML is truth.
+                # If HTML shows A -> B -> C', and History has A -> B -> C -> D.
+                # And scraper sees A -> B -> C'.
+                # We should probably result in A -> B -> C'. 
+                # Because C' implies C was edited/regenerated, invalidating D.
+                
+                # But what if scraper just sees A -> B (scrolled top) and C -> D is offscreen bottom?
+                # Then scraped=[A, B]. match=A. is_subset=True. We do NOT cut.
+                
+                # Conclusion:
+                # If it's a subset (IDs match), we update content and DO NOT cut.
+                # If it's divergent (IDs mismatch at some point), we must assume a branch change.
+                # BUT, we only see a window. 
+                # If scraped=[A, B_new], and history=[A, B_old, C, D].
+                # match=A. A==A. B_new != B_old.
+                # We splice -> [A, B_new]. We lose C, D. 
+                # This is CORRECT for Gemini behavior: Editing B removes C and D.
+                
+                print(f"[Sync] Divergence/Branch detected at index {match_index}. Splicing.")
+                self.history = self.history[:match_index] + scraped_messages
+                self.message_map = {msg['id']: i for i, msg in enumerate(self.history)}
+                changes_made = True
+                
+        else:
+            # Case B: No Overlap (Completely new or Gap)
+            # If history is empty, easy.
+            if not self.history:
+                self.history = scraped_messages
+                changes_made = True
+            else:
+                # Check if it fits at the end?
+                # last_msg = self.history[-1]
+                # If completely disjoint, we might be scrolling down after a gap?
+                # Or scrolling up past memory?
+                # For safety, we append. merging is hard without overlap.
+                
+                # Try soft match? (Text based)
+                # ... skipping for now to simple append.
+                # Check if we should append or prepend (rare).
+                # Assume append.
+                
+                # Check for duplicates that got missed by ID match?
+                # Trust the ID.
+                self.history.extend(scraped_messages)
+                changes_made = True
+                print(f"[Sync] appended {len(scraped_messages)} messages (No overlap found)")
 
-                # Case C: Genuine New Message
-                if not is_merged:
-                    self.history.append(new_msg)
-                    self.message_map[msg_id] = len(self.history) - 1
-                    changes_made = True
-                    new_count += 1
-                    role_icon = "👤" if new_msg['role'] == 'user' else "🤖"
-                    print(f"[New] {role_icon} Added: {new_msg['text'][:40]}...")
-
+        # Re-build map and save if changed
         if changes_made:
+            self.message_map = {msg['id']: i for i, msg in enumerate(self.history)}
             self.save()
-            if new_count > 0:
-                print(f"[Sync] Saved {len(self.history)} messages. (+{new_count} new)")
 
 async def main():
     print("==========================================")
     print("      GemKeeper v4.3 - Throttled Push     ")
     print("==========================================")
+    
+    # Pre-flight check: Cleanup locks
+    cleanup_stale_git_locks(KB_ROOT)
     
     async with async_playwright() as p:
         try:
@@ -646,18 +771,22 @@ async def main():
                     continue
 
                 extracted_id = extract_chat_id(curr_url)
-                target_session_id = extracted_id if extracted_id else "New_Session"
                 
-                if target_session_id != current_chat_id:
-                    print(f"\n[Switch] Detected Change: {current_chat_id} -> {target_session_id}")
-                    current_chat_id = target_session_id
-                    active_session = GemSessionV4(target_session_id)
+                # Logic Update: Do not create session if ID is missing (e.g. New Chat page)
+                if extracted_id != current_chat_id:
+                    print(f"\n[Switch] Detected Change: {current_chat_id} -> {extracted_id}")
+                    current_chat_id = extracted_id
+                    
+                    if extracted_id:
+                        active_session = GemSessionV4(extracted_id)
+                    else:
+                        active_session = None
                 
                 # Update call: Pass current_chat_id
                 messages, candidate_title, header_title = await scrape_page(
                     page, 
                     smart_title_fallback=True, 
-                    current_chat_id=target_session_id
+                    current_chat_id=current_chat_id
                 )
                 
                 # --- Watchdog Logic ---

@@ -15,7 +15,7 @@ timeout /t 5 /nobreak > nul
 
 echo.
 echo ==========================================================
-echo   [2/2] Starting GemKeeper Python Script (Compact & Silent)...
+echo   [2/2] Starting GemKeeper Python Script (Compact ^& Silent)...
 echo ==========================================================
 
 :: [핵심] pythonw.exe를 사용하여 콘솔 창(터미널) 없이 백그라운드에서 실행합니다.
